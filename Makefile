@@ -3,6 +3,9 @@ all: noise-exporter
 noise-exporter:
 	go build -o . ./...
 
+clean:
+	rm -f noise-exporter pi-noise-exporter
+
 pi:
 	GOOS=linux \
 	GOARCH=arm \
