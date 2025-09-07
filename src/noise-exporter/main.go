@@ -12,8 +12,9 @@ import (
 )
 
 var (
-	flagAddr  = flag.String("addr", ":9900", "Listen on address")
-	flagDebug = flag.Bool("debug", false, "Print debug messages")
+	flagAddr       = flag.String("addr", ":9900", "Listen on address")
+	flagDebug      = flag.Bool("debug", false, "Print debug messages")
+	flagListDevices = flag.Bool("list-devices", false, "List available audio devices and exit")
 )
 
 type metrics struct {
@@ -105,15 +106,66 @@ func main() {
 	registry := prometheus.NewRegistry()
 	m := newMetrics(registry)
 
-	portaudio.Initialize()
+	log.Printf("Initializing PortAudio...")
+	err := portaudio.Initialize()
+	if err != nil {
+		log.Fatalf("Failed to initialize PortAudio: %v", err)
+	}
 	defer portaudio.Terminate()
+	log.Printf("PortAudio initialized successfully")
+
+	// Always print available audio devices for debugging
+	log.Printf("Enumerating audio devices...")
+	devices, err := portaudio.Devices()
+	if err != nil {
+		log.Printf("Warning: Failed to get devices: %v", err)
+	} else {
+		log.Printf("Found %d audio devices:", len(devices))
+		for i, device := range devices {
+			log.Printf("  Device %d: %s", i, device.Name)
+			if *flagListDevices || *flagDebug {
+				log.Printf("    Max input channels: %d", device.MaxInputChannels)
+				log.Printf("    Max output channels: %d", device.MaxOutputChannels)
+				log.Printf("    Default sample rate: %.0f Hz", device.DefaultSampleRate)
+				log.Printf("    Low input latency: %.3f ms", device.DefaultLowInputLatency.Seconds()*1000)
+				log.Printf("    High input latency: %.3f ms", device.DefaultHighInputLatency.Seconds()*1000)
+				if device.HostApi != nil {
+					log.Printf("    Host API: %s", device.HostApi.Name)
+				}
+			}
+		}
+	}
+
+	// Always print default devices for debugging
+	defaultInput, err := portaudio.DefaultInputDevice()
+	if err != nil {
+		log.Printf("Warning: No default input device: %v", err)
+	} else {
+		log.Printf("Default input device: %s", defaultInput.Name)
+		log.Printf("  Max input channels: %d", defaultInput.MaxInputChannels)
+		log.Printf("  Default sample rate: %.0f Hz", defaultInput.DefaultSampleRate)
+	}
+
+	// If just listing devices, exit here
+	if *flagListDevices {
+		log.Printf("Device listing complete - exiting")
+		return
+	}
 
 	// Initialize A-weighting filter and time weighting
+	log.Printf("Creating audio processing filters...")
 	aFilter := newAWeightingFilter()
 	slowWeighting := newTimeWeighting(1.0)   // 1 second for LAS
 	fastWeighting := newTimeWeighting(0.125) // 0.125 second for LAF
 
+	callbackCount := 0
 	stream, err := portaudio.OpenDefaultStream(channels, 0, sampleRate, 0, func(in []float32) {
+		callbackCount++
+		
+		if *flagDebug && callbackCount%100 == 1 { // Every ~2 seconds at typical buffer sizes
+			log.Printf("Audio callback #%d: received %d samples", callbackCount, len(in))
+		}
+
 		// Original instant measurement (keep for compatibility)
 		decibels := make([]float64, len(in))
 		var sum float64 = 0
@@ -125,7 +177,14 @@ func main() {
 
 		// Proper A-weighted sound level calculation
 		var squaredSum float64 = 0
+		maxSample := float64(0)
 		for _, sample := range in {
+			// Track max sample for debugging
+			absSample := math.Abs(float64(sample))
+			if absSample > maxSample {
+				maxSample = absSample
+			}
+			
 			// Apply A-weighting filter
 			weighted := aFilter.process(float64(sample))
 			// Square the weighted pressure value
@@ -135,31 +194,44 @@ func main() {
 		// Calculate RMS of the A-weighted signal
 		rms := math.Sqrt(squaredSum / float64(len(in)))
 
+		// Use a noise floor to handle very quiet signals (equivalent to about -100 dB)
+		noiseFloor := 1e-5 * pRef  // Very quiet but not zero
+		if rms < noiseFloor {
+			rms = noiseFloor
+		}
+
 		// Convert to decibels
-		if rms > 0 {
-			instantLA := 20 * math.Log10(rms/pRef)
+		instantLA := 20 * math.Log10(rms/pRef)
 
-			// Apply time weighting
-			slowLA := slowWeighting.process(instantLA)
-			fastLA := fastWeighting.process(instantLA)
+		// Apply time weighting
+		slowLA := slowWeighting.process(instantLA)
+		fastLA := fastWeighting.process(instantLA)
 
-			// Update metrics
-			m.lAS.Set(slowLA)
-			m.lAF.Set(fastLA)
+		// Update metrics
+		m.lAS.Set(slowLA)
+		m.lAF.Set(fastLA)
 
-			if *flagDebug {
-				log.Printf("LA instant: %.1f dB, LAS: %.1f dB, LAF: %.1f dB",
-					instantLA, slowLA, fastLA)
+		if *flagDebug {
+			// Reduced frequency output (every ~1 second depending on buffer size)
+			if callbackCount%200 == 1 { 
+				log.Printf("Audio: max=%.6f, rms=%.6f (%.1f dB), LAS: %.1f dB, LAF: %.1f dB",
+					maxSample, rms, instantLA, slowLA, fastLA)
 			}
 		}
 	})
 
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to open audio stream: %v", err)
 	}
-
-	stream.Start()
+	log.Printf("Audio stream opened successfully")
+	
+	log.Printf("Starting audio stream...")
+	err = stream.Start()
+	if err != nil {
+		log.Fatalf("Failed to start audio stream: %v", err)
+	}
 	defer stream.Close()
+	log.Printf("Audio stream started successfully - now capturing audio")
 
 	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{Registry: registry}))
 	log.Fatal(http.ListenAndServe(*flagAddr, nil))
