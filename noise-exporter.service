@@ -1,0 +1,20 @@
+[Unit]
+Description=Noise Exporter
+
+[Service]
+ExecStart=/usr/bin/noise-exporter -addr=:9900
+Environment=JACK_NO_START_SERVER=1
+
+# Process priority (-20 to 19, lower = higher priority)
+Nice=-10
+
+# I/O scheduling class and priority
+IOSchedulingClass=1
+IOSchedulingPriority=4
+
+# CPU scheduling policy
+CPUSchedulingPolicy=2
+CPUSchedulingPriority=50
+
+[Install]
+WantedBy=multi-user.target

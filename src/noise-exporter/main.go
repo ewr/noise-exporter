@@ -1,10 +1,15 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
+	"os"
+	"time"
 
 	"github.com/gordonklaus/portaudio"
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,6 +20,7 @@ var (
 	flagAddr       = flag.String("addr", ":9900", "Listen on address")
 	flagDebug      = flag.Bool("debug", false, "Print debug messages")
 	flagListDevices = flag.Bool("list-devices", false, "List available audio devices and exit")
+	flagTestFile   = flag.String("test-file", "", "Test with WAV file instead of live audio input")
 )
 
 type metrics struct {
@@ -60,25 +66,223 @@ func (f *AWeightingFilter) process(input float64) float64 {
 
 // Time weighting for sound level meters
 type TimeWeighting struct {
-	alpha       float64 // exponential averaging coefficient
-	average     float64 // current average
-	initialized bool
+	timeConstant float64 // original time constant in seconds
+	average      float64 // current average
+	initialized  bool
 }
 
 func newTimeWeighting(timeConstant float64) *TimeWeighting {
-	// Calculate alpha for exponential averaging
-	alpha := math.Exp(-1.0 / (timeConstant * sampleRate))
-	return &TimeWeighting{alpha: alpha}
+	return &TimeWeighting{timeConstant: timeConstant}
 }
 
-func (tw *TimeWeighting) process(input float64) float64 {
+func (tw *TimeWeighting) process(input float64, bufferSize int) float64 {
 	if !tw.initialized {
 		tw.average = input
 		tw.initialized = true
 	} else {
-		tw.average = tw.alpha*tw.average + (1-tw.alpha)*input
+		// Calculate alpha based on actual buffer size and time constant
+		// This ensures the time constant is independent of buffer size
+		bufferTime := float64(bufferSize) / sampleRate
+		alpha := math.Exp(-bufferTime / tw.timeConstant)
+		tw.average = alpha*tw.average + (1-alpha)*input
 	}
 	return tw.average
+}
+
+// WAV file header structure
+type WAVHeader struct {
+	ChunkID       [4]byte
+	ChunkSize     uint32
+	Format        [4]byte
+	Subchunk1ID   [4]byte
+	Subchunk1Size uint32
+	AudioFormat   uint16
+	NumChannels   uint16
+	SampleRate    uint32
+	ByteRate      uint32
+	BlockAlign    uint16
+	BitsPerSample uint16
+	Subchunk2ID   [4]byte
+	Subchunk2Size uint32
+}
+
+// Read and parse WAV file header
+func readWAVHeader(file *os.File) (*WAVHeader, error) {
+	header := &WAVHeader{}
+	err := binary.Read(file, binary.LittleEndian, header)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read WAV header: %v", err)
+	}
+
+	// Validate WAV format
+	if string(header.ChunkID[:]) != "RIFF" {
+		return nil, fmt.Errorf("not a valid RIFF file")
+	}
+	if string(header.Format[:]) != "WAVE" {
+		return nil, fmt.Errorf("not a valid WAVE file")
+	}
+	if string(header.Subchunk1ID[:]) != "fmt " {
+		return nil, fmt.Errorf("invalid format chunk")
+	}
+	if string(header.Subchunk2ID[:]) != "data" {
+		return nil, fmt.Errorf("invalid data chunk")
+	}
+
+	return header, nil
+}
+
+// Process WAV file in chunks and update metrics
+func processWAVFile(filename string, m *metrics) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open WAV file: %v", err)
+	}
+	defer file.Close()
+
+	header, err := readWAVHeader(file)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("WAV file info:")
+	log.Printf("  Sample rate: %d Hz", header.SampleRate)
+	log.Printf("  Channels: %d", header.NumChannels)
+	log.Printf("  Bits per sample: %d", header.BitsPerSample)
+	log.Printf("  Audio format: %d (3=IEEE float)", header.AudioFormat)
+	log.Printf("  Data size: %d bytes", header.Subchunk2Size)
+
+	// Validate format matches our expectations
+	if header.SampleRate != sampleRate {
+		return fmt.Errorf("sample rate mismatch: expected %d, got %d", sampleRate, header.SampleRate)
+	}
+	if header.NumChannels != channels {
+		return fmt.Errorf("channel count mismatch: expected %d, got %d", channels, header.NumChannels)
+	}
+	if header.AudioFormat != 3 {
+		return fmt.Errorf("expected IEEE float format (3), got %d", header.AudioFormat)
+	}
+	if header.BitsPerSample != 32 {
+		return fmt.Errorf("expected 32-bit samples, got %d", header.BitsPerSample)
+	}
+
+	// Initialize filters
+	aFilter := newAWeightingFilter()
+	slowWeighting := newTimeWeighting(1.0)   // 1 second for LAS
+	fastWeighting := newTimeWeighting(0.125) // 0.125 second for LAF
+
+	// Process in chunks similar to audio callback
+	chunkSize := 417 // samples per chunk (realistic device buffer size)
+	chunk := make([]float32, chunkSize)
+	chunkCount := 0
+	totalSamples := int(header.Subchunk2Size) / 4 // 4 bytes per float32
+
+	log.Printf("Processing %d samples in chunks of %d...", totalSamples, chunkSize)
+
+	for {
+		// Read chunk by chunk using io.ReadFull for exact control
+		bytesToRead := chunkSize * 4 // 4 bytes per float32
+		buffer := make([]byte, bytesToRead)
+		n, err := io.ReadFull(file, buffer)
+
+		if err == io.EOF {
+			break
+		}
+		if err == io.ErrUnexpectedEOF {
+			// Handle partial read at end of file
+			if n == 0 {
+				break
+			}
+			// Adjust chunk size for partial read
+			actualSamples := n / 4
+			chunk = make([]float32, actualSamples)
+			bytesToRead = actualSamples * 4
+			buffer = buffer[:bytesToRead]
+		} else if err != nil {
+			return fmt.Errorf("failed to read audio data: %v", err)
+		}
+
+		// Convert bytes to float32 samples
+		for i := 0; i < len(buffer)/4; i++ {
+			bits := binary.LittleEndian.Uint32(buffer[i*4 : (i+1)*4])
+			chunk[i] = math.Float32frombits(bits)
+		}
+
+		chunkCount++
+
+		// Process this chunk exactly like the audio callback
+		processAudioChunk(chunk, m, aFilter, slowWeighting, fastWeighting, chunkCount)
+
+		// Simulate real-time processing
+		actualChunkSize := len(chunk)
+		time.Sleep(time.Duration(float64(actualChunkSize)/float64(sampleRate)*1000) * time.Millisecond)
+
+		// Reset chunk size for next iteration
+		if len(chunk) != chunkSize {
+			chunk = make([]float32, chunkSize)
+		}
+	}
+
+	log.Printf("Finished processing WAV file: %d chunks, %d total samples", chunkCount, totalSamples)
+	return nil
+}
+
+// Extract audio processing logic into a separate function
+func processAudioChunk(in []float32, m *metrics, aFilter *AWeightingFilter, slowWeighting, fastWeighting *TimeWeighting, chunkCount int) {
+	if *flagDebug && chunkCount%100 == 1 {
+		log.Printf("Processing chunk #%d: %d samples", chunkCount, len(in))
+	}
+
+	// Original instant measurement (keep for compatibility)
+	decibels := make([]float64, len(in))
+	var sum float64 = 0
+	for i := range in {
+		decibels[i] = 20 * math.Log10(math.Abs(float64(in[i]))/pRef)
+		sum += float64(decibels[i])
+	}
+	m.lAeq.Set(sum / float64(len(in)))
+
+	// Proper A-weighted sound level calculation
+	var squaredSum float64 = 0
+	maxSample := float64(0)
+	for _, sample := range in {
+		// Track max sample for debugging
+		absSample := math.Abs(float64(sample))
+		if absSample > maxSample {
+			maxSample = absSample
+		}
+
+		// Apply A-weighting filter
+		weighted := aFilter.process(float64(sample))
+		// Square the weighted pressure value
+		squaredSum += weighted * weighted
+	}
+
+	// Calculate RMS of the A-weighted signal
+	rms := math.Sqrt(squaredSum / float64(len(in)))
+
+	// Use a noise floor to handle very quiet signals
+	noiseFloor := 1e-5 * pRef
+	if rms < noiseFloor {
+		rms = noiseFloor
+	}
+
+	// Convert to decibels
+	instantLA := 20 * math.Log10(rms/pRef)
+
+	// Apply time weighting
+	slowLA := slowWeighting.process(instantLA, len(in))
+	fastLA := fastWeighting.process(instantLA, len(in))
+
+	// Update metrics
+	m.lAS.Set(slowLA)
+	m.lAF.Set(fastLA)
+
+	if *flagDebug {
+		if chunkCount%200 == 1 {
+			log.Printf("Audio: max=%.6f, rms=%.6f (%.1f dB), LAS: %.1f dB, LAF: %.1f dB",
+				maxSample, rms, instantLA, slowLA, fastLA)
+		}
+	}
 }
 
 func newMetrics(reg prometheus.Registerer) *metrics {
@@ -152,6 +356,32 @@ func main() {
 		return
 	}
 
+	// Check if we're in test mode with a WAV file
+	if *flagTestFile != "" {
+		log.Printf("Test mode: processing WAV file %s", *flagTestFile)
+
+		// Start HTTP server in background
+		http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{Registry: registry}))
+		go func() {
+			log.Printf("Starting HTTP server on %s", *flagAddr)
+			log.Fatal(http.ListenAndServe(*flagAddr, nil))
+		}()
+
+		// Process the WAV file
+		err := processWAVFile(*flagTestFile, m)
+		if err != nil {
+			log.Fatalf("Failed to process WAV file: %v", err)
+		}
+
+		// Keep the server running after processing
+		log.Printf("WAV file processing complete. HTTP server still running on %s", *flagAddr)
+		log.Printf("Press Ctrl+C to exit")
+		select {} // Block forever
+	}
+
+	// Normal live audio processing mode
+	log.Printf("Live audio mode: capturing from microphone")
+
 	// Initialize A-weighting filter and time weighting
 	log.Printf("Creating audio processing filters...")
 	aFilter := newAWeightingFilter()
@@ -161,70 +391,14 @@ func main() {
 	callbackCount := 0
 	stream, err := portaudio.OpenDefaultStream(channels, 0, sampleRate, 0, func(in []float32) {
 		callbackCount++
-		
-		if *flagDebug && callbackCount%100 == 1 { // Every ~2 seconds at typical buffer sizes
-			log.Printf("Audio callback #%d: received %d samples", callbackCount, len(in))
-		}
-
-		// Original instant measurement (keep for compatibility)
-		decibels := make([]float64, len(in))
-		var sum float64 = 0
-		for i := range in {
-			decibels[i] = 20 * math.Log10(math.Abs(float64(in[i]))/pRef)
-			sum += float64(decibels[i])
-		}
-		m.lAeq.Set(sum / float64(len(in)))
-
-		// Proper A-weighted sound level calculation
-		var squaredSum float64 = 0
-		maxSample := float64(0)
-		for _, sample := range in {
-			// Track max sample for debugging
-			absSample := math.Abs(float64(sample))
-			if absSample > maxSample {
-				maxSample = absSample
-			}
-			
-			// Apply A-weighting filter
-			weighted := aFilter.process(float64(sample))
-			// Square the weighted pressure value
-			squaredSum += weighted * weighted
-		}
-
-		// Calculate RMS of the A-weighted signal
-		rms := math.Sqrt(squaredSum / float64(len(in)))
-
-		// Use a noise floor to handle very quiet signals (equivalent to about -100 dB)
-		noiseFloor := 1e-5 * pRef  // Very quiet but not zero
-		if rms < noiseFloor {
-			rms = noiseFloor
-		}
-
-		// Convert to decibels
-		instantLA := 20 * math.Log10(rms/pRef)
-
-		// Apply time weighting
-		slowLA := slowWeighting.process(instantLA)
-		fastLA := fastWeighting.process(instantLA)
-
-		// Update metrics
-		m.lAS.Set(slowLA)
-		m.lAF.Set(fastLA)
-
-		if *flagDebug {
-			// Reduced frequency output (every ~1 second depending on buffer size)
-			if callbackCount%200 == 1 { 
-				log.Printf("Audio: max=%.6f, rms=%.6f (%.1f dB), LAS: %.1f dB, LAF: %.1f dB",
-					maxSample, rms, instantLA, slowLA, fastLA)
-			}
-		}
+		processAudioChunk(in, m, aFilter, slowWeighting, fastWeighting, callbackCount)
 	})
 
 	if err != nil {
 		log.Fatalf("Failed to open audio stream: %v", err)
 	}
 	log.Printf("Audio stream opened successfully")
-	
+
 	log.Printf("Starting audio stream...")
 	err = stream.Start()
 	if err != nil {
@@ -234,6 +408,6 @@ func main() {
 	log.Printf("Audio stream started successfully - now capturing audio")
 
 	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{Registry: registry}))
+	log.Printf("Starting HTTP server on %s", *flagAddr)
 	log.Fatal(http.ListenAndServe(*flagAddr, nil))
-	log.Printf("Listening on %s", *flagAddr)
 }

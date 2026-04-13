@@ -1,3 +1,5 @@
 /noise-exporter
 /pi-noise-exporter
 .DS_Store
+.env
+*.wav
